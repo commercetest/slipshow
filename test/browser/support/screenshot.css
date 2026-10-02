@@ -1,0 +1,10 @@
+/* Applied only while making an asserted screenshot. Keep this narrowly scoped:
+   hiding real presentation content would make the visual oracle weaker. */
+
+html {
+  color-scheme: light;
+}
+/* Cursor disappearance is timer-driven and is not part of these baselines. */
+* {
+  cursor: none !important;
+}
