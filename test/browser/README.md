@@ -165,6 +165,178 @@ npm run test:update
 `npm run test:update` is a review operation, not routine failure recovery.
 Before accepting a changed image, record why the new rendering is correct.
 
+### Watching and debugging the tests
+
+The dependencies and Playwright-managed browsers were already installed in
+the spike clone when these commands were checked. On the macOS development
+host, use Node 22 and the library-path workaround recorded above:
+
+```sh
+cd /Users/julianharty/NLnet-projects/testing-slipshow-analysis/clones/slipshow-playwright-spike/test/browser
+
+export PATH="/opt/homebrew/opt/node@22/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"
+export LIBRARY_PATH="/opt/homebrew/opt/openssl@3/lib:/opt/homebrew/opt/libffi/lib"
+```
+
+Run the authoritative headless comparisons with:
+
+```sh
+opam exec --switch=/Users/julianharty/NLnet-projects/slipshow -- \
+  npm test
+```
+
+Open Playwright's interactive test interface with:
+
+```sh
+opam exec --switch=/Users/julianharty/NLnet-projects/slipshow -- \
+  npm run test:ui
+```
+
+UI mode is useful for selecting tests, rerunning them, and inspecting the
+recorded action and page snapshots. To watch a real Chromium window run the
+tests, use headed mode:
+
+```sh
+opam exec --switch=/Users/julianharty/NLnet-projects/slipshow -- \
+  npm run test:chromium -- --headed --ignore-snapshots
+```
+
+The corresponding Firefox command is:
+
+```sh
+opam exec --switch=/Users/julianharty/NLnet-projects/slipshow -- \
+  npm run test:firefox -- --headed --ignore-snapshots
+```
+
+`--ignore-snapshots` is intentional in these observation runs. It retains the
+semantic, DOM, and geometric assertions but does not compare images made by a
+headed browser with the existing headless baselines. See the investigation
+below for why those images differ.
+
+For a slower, step-by-step Chromium run in Playwright Inspector, focus on one
+test and use `--debug`:
+
+```sh
+opam exec --switch=/Users/julianharty/NLnet-projects/slipshow -- \
+  ./node_modules/.bin/playwright test tests/states.visual.spec.mjs:4 \
+  --project=chromium --debug --ignore-snapshots
+```
+
+Do not combine `--headed` with `test:update` against the current projects.
+That would replace headless reference images with images from a different
+rendering mode and make the normal headless comparison fail. If headed image
+comparison becomes a requirement, add a separately named headed project and
+give it separately reviewed baselines; the existing snapshot path already
+includes `{projectName}`.
+
+### Headed-versus-headless pixel investigation
+
+This investigation was performed on 2026-10-05 and 2026-10-06 using the
+pinned Playwright 1.59.1 Chromium revision 1217 on macOS/Apple silicon.
+
+The ordinary test run launches `chromium_headless_shell-1217`; `--headed`
+launches the regular `chromium-1217` build. This is intentional Playwright
+behaviour: it ships a separate Chromium headless shell for default headless
+operation and regular Chromium for headed operation. Playwright also warns
+that screenshots vary with the operating system, browser version, settings,
+hardware, power source, and headless mode. Consequently, headed and headless
+captures must not be assumed to share a pixel baseline. See Playwright's
+[browser documentation](https://playwright.dev/docs/browsers#chromium-headless-shell)
+and [visual-comparison documentation](https://playwright.dev/docs/test-snapshots).
+
+#### The initial 39-pixel failure
+
+The first observed failure was `state-00-initial.png`, a 1440x1080 image:
+
+- Playwright/pixelmatch counted 39 different pixels.
+- The generated diff also marked 91 pixels as antialiasing differences and
+  excluded them from the failure count. In pixelmatch's diff image, red means
+  counted difference and yellow means detected antialiasing.
+- Of the 39 counted pixels, 37 are in the 32x32 circular pencil button at the
+  upper-left. The other two are isolated glyph-edge pixels in the slide text.
+- The differences change edge coverage rather than geometry. For example, one
+  grey icon-edge pixel is `(217,217,217)` in the headless baseline and
+  `(163,163,163)` in headed Chromium. The icon, boxes, text positions, and
+  overall slide layout remain coincident.
+- Three fresh headed runs produced byte-for-byte identical actual PNGs, all
+  with the same SHA-256 and the same 39-pixel failure. This particular result
+  is therefore deterministic on the pinned host, not timing noise.
+
+The best explanation is the different Chromium executables' rasterisation of
+antialiased SVG strokes and text at fractional coverage. There is no evidence
+in this image of a Slipshow state, rescaling, alignment, or clipping defect.
+
+#### Portfolio sample
+
+A full headed Chromium run was also sampled. Each test stops at its first
+failed screenshot, so this covers the first visual checkpoint of all 11 tests,
+not every one of the 15 Chromium baselines:
+
+| First checkpoint | Size | Counted pixels | Antialias-only pixels |
+| --- | ---: | ---: | ---: |
+| Drawing at 4:3 | 1440x1080 | 191 | 687 |
+| Layout at 4:3 | 1440x1080 | 39 | 91 |
+| Layout widescreen | 1600x900 | 60 | 69 |
+| Layout portrait | 900x1200 | 25 | 111 |
+| Projected content | 1440x1080 | 39 | 91 |
+| Embedded renderers | 1440x1080 | 43 | 78 |
+| Speaker view | 1440x1080 | 8,324 | 5,397 |
+| Initial runtime state | 1440x1080 | 39 | 91 |
+| Default theme element | 1218x914 | 2 | 27 |
+| Table of contents | 1440x1080 | 24 | 143 |
+| Expanded drawing toolbar | 390x595 | 2,356 | 1,449 |
+
+Most differences are sparse edge-rasterisation changes. In the drawing image,
+the long blue stroke remains aligned; differences concentrate in the dense
+drawing controls, box corners, text edges, and the stroke endpoint. The toolbar
+has a much larger count because nearly the whole small image consists of text,
+circles, diagonal SVG strokes, and rounded outlines, but its geometry and
+content remain visually coincident.
+
+Speaker view is different in kind. The regular headed browser displays a
+scrollbar for `#speaker-notes`, whose CSS is `overflow: scroll`; the headless
+shell is launched with hidden scrollbars. The visible scrollbar consumes about
+15 CSS pixels, changes the right column's content width, and changes text
+wrapping/clipping. That mismatch is germane to the headed user experience and
+should not be dismissed as mere antialiasing. It is also sensitive to the OS
+scrollbar policy, so it is a poor candidate for sharing a baseline between
+headed and headless modes. The intended scrollbar behaviour and speaker-view
+geometry deserve a separate assertion or targeted test.
+
+#### Assessment and maintenance implications
+
+- The small icon, glyph, border, and drawing-edge differences are not germane
+  to the Slipshow behaviours those tests are intended to protect. They are,
+  however, valid evidence that the capture environment does not match the
+  baseline environment.
+- The speaker-view reflow is germane. A headless screenshot with hidden
+  scrollbars does not fully represent what a presenter sees in a regular
+  browser window.
+- The pinned headed result is deterministic in the repeated sample, and the
+  general class of difference is predictable. The exact pixels and counts are
+  not portable predictions across browser, Playwright, operating-system, font,
+  graphics, or scrollbar-setting changes.
+- A Playwright update normally selects a new browser revision. Over a sequence
+  of upgrades, strict zero-tolerance screenshots containing text, SVG, shadows,
+  transforms, and embedded renderers are likely to acquire at least small
+  diffs, even when Slipshow has not changed. Baseline review should therefore
+  be an explicit part of browser-toolchain upgrades.
+- Pinning Playwright and its browser revisions, and running required comparisons
+  in one pinned CI image, makes ordinary runs reproducible between deliberate
+  upgrades. The current lockfile provides the browser-version pin locally;
+  OS/font/graphics stability still needs the proposed CI container.
+- Do not solve these observations with a broad global pixel tolerance. That
+  could conceal the small rescaling and drawing-alignment regressions this
+  portfolio is meant to find. Keep the authoritative headless baselines strict,
+  inspect diffs during controlled upgrades, and use semantic/geometric
+  assertions to decide whether a visual change represents a product defect.
+- If live, comparable Chromium runs are worth their additional baseline cost,
+  create a distinct headed project. Another option worth evaluating is
+  Playwright's `channel: "chromium"` new-headless mode, which uses regular
+  Chromium rather than the separate headless shell. Either change requires a
+  fresh baseline review and does not eliminate OS scrollbar or font-rendering
+  differences.
+
 ## Baseline and CI policy
 
 Playwright documents that browser screenshots vary with operating system,
